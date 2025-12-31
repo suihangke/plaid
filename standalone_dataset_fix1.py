@@ -73,12 +73,16 @@ def _group_texts(examples, block_size, bos, eos, insert_special_tokens=True):
     result = {}
     _values = []
     _attn_masks = []
+    # Create attention mask as a list (not tensor) to avoid CUDA issues in multiprocessing
+    # The dataset will convert to tensors later when set_format is called
+    attn_mask_list = [1] * block_size
     for i in range(0, total_length, new_block_size):
         if insert_special_tokens:
             _values.append([bos] + concatenated_examples[i : i + new_block_size] + [eos])
         else:
             _values.append(concatenated_examples[i : i + new_block_size])
-        _attn_masks.append(torch.ones(block_size))
+        # _attn_masks.append(torch.ones(block_size))
+        _attn_masks.append(attn_mask_list.copy())
     result["input_ids"] = _values
     result["attention_mask"] = _attn_masks
     return result
@@ -116,7 +120,11 @@ class MultiDataset(torch.utils.data.Dataset):
             self._setup_tokenizer_for_wrapping()
 
         # Determine detokenizer based on dataset
-        if data_path == "lm1b":
+        # Check if it's LM1B (either "lm1b" string or local path containing "lm1b")
+        is_lm1b = (data_path == "lm1b" or 
+                   (isinstance(data_path, str) and os.path.isdir(data_path) and "lm1b" in data_path.lower()))
+        
+        if is_lm1b:
             self.detokenizer = lm1b_detokenizer
         else:
             self.detokenizer = None
@@ -126,6 +134,30 @@ class MultiDataset(torch.utils.data.Dataset):
             # Use HuggingFace lm1b dataset
             hf_split = "train" if split == "train" else "test"
             dataset = load_dataset("dvruette/lm1b", split=hf_split)
+            if split != "train" and max_val_samples is not None and max_val_samples > 0:
+                if not streaming:
+                    dataset = dataset.select(range(min(max_val_samples, len(dataset))))
+        elif is_lm1b and os.path.isdir(data_path):
+            # Use local LM1B dataset directory
+            hf_split = "train" if split == "train" else "test"
+            # Try loading from local directory - first try as a local dataset path
+            try:
+                # Try loading as a local dataset (if it's a saved dataset)
+                from datasets import load_from_disk
+                dataset = load_from_disk(data_path)
+                if hf_split in dataset:
+                    dataset = dataset[hf_split]
+                elif split == "train" and "train" in dataset:
+                    dataset = dataset["train"]
+                elif split != "train" and "test" in dataset:
+                    dataset = dataset["test"]
+            except:
+                # If load_from_disk fails, try loading with HuggingFace dataset loader
+                try:
+                    dataset = load_dataset("dvruette/lm1b", split=hf_split, data_dir=data_path)
+                except:
+                    # Last resort: try loading the directory as a dataset
+                    dataset = load_dataset(data_path, split=hf_split)
             if split != "train" and max_val_samples is not None and max_val_samples > 0:
                 if not streaming:
                     dataset = dataset.select(range(min(max_val_samples, len(dataset))))
@@ -150,8 +182,9 @@ class MultiDataset(torch.utils.data.Dataset):
             )
 
         # Remove original text columns
-        if data_path in ["lm1b", "openwebtext"]:
-            tokenized_dataset = tokenized_dataset.remove_columns("text")
+        if is_lm1b or data_path in ["lm1b", "openwebtext"]:
+            if "text" in tokenized_dataset.column_names:
+                tokenized_dataset = tokenized_dataset.remove_columns("text")
 
         # Group texts if wrapping is enabled
         if wrap:
@@ -176,6 +209,13 @@ class MultiDataset(torch.utils.data.Dataset):
 
     def _setup_tokenizer_for_wrapping(self):
         """Setup tokenizer for wrapped batches (from reference)"""
+        # Increase model_max_length to allow longer sequences during tokenization
+        # Since we'll chunk sequences later, we don't need to truncate here
+        if hasattr(self.tokenizer, 'model_max_length'):
+            # Set to a very large value to avoid truncation warnings
+            # The actual chunking will happen in _group_texts
+            self.tokenizer.model_max_length = 1_000_000  # Large enough for most texts
+        
         # Ensure BOS/EOS tokens exist
         if self.tokenizer.bos_token is None:
             if self.tokenizer.cls_token is None:
@@ -186,7 +226,14 @@ class MultiDataset(torch.utils.data.Dataset):
                 raise AttributeError(f"Tokenizer must have a eos_token or sep_token: {self.tokenizer}")
             self.tokenizer.eos_token = self.tokenizer.sep_token
         if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            # Try to use eos_token as pad_token first
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            else:
+                # Add a new pad token if eos_token is also not available
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                self.tokenizer.pad_token_id = self.tokenizer.get_vocab()["[PAD]"]
 
         # GPT2 tokenizer setup from reference
         if isinstance(self.tokenizer, transformers.GPT2TokenizerFast) or isinstance(
@@ -217,8 +264,14 @@ class MultiDataset(torch.utils.data.Dataset):
 
         if self.wrap:
             # Wrapped tokenization: add EOS only if insert_eos=True, BOS added later in group_texts
+            # Explicitly disable truncation since we'll chunk sequences later
             tokens = self.tokenizer(
-                texts, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False
+                texts, 
+                add_special_tokens=False, 
+                return_attention_mask=False, 
+                return_token_type_ids=False,
+                truncation=False,  # Don't truncate - we'll chunk later
+                padding=False,  # Don't pad - we'll handle this in grouping
             )
             if self.insert_eos:
                 EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
@@ -276,12 +329,16 @@ def get_dataset(config: DatasetConfig, tokenizer, split="train"):
 
 def get_dataloader(config, tokenizer, split="train"):
     dataset = get_dataset(config, tokenizer, split=split)
+    # Don't provide a generator - let DataLoader create its own internally
+    # This avoids device mismatch issues when torch.set_default_device('cuda') is set
+    # The DataLoader will handle generator creation with the correct device
+    
     return DataLoader(
         dataset,
         batch_size=config.batch_size if split == "train" else config.eval_batch_size,
         shuffle=(split == "train") and not config.streaming,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=True
     )
 
 
