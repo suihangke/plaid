@@ -9,6 +9,7 @@ import os
 import time
 import torch
 import torch.nn.functional as F
+import transformers
 import tqdm
 from torch import nn, optim, autograd
 
@@ -18,8 +19,9 @@ def main(**args):
 
     args = lib.utils.AttributeDict(args)
     args.setdefault('seq_len', 256)
-    args.setdefault('vocab_size', 32768)
+    args.setdefault('vocab_size', None)  # Will be auto-detected from tokenizer or checkpoint
     args.setdefault('weights_path', None)
+    args.setdefault('checkpoint_dir', None)  # If None, will infer from weights_path
     args.setdefault('dim', 2048)
     args.setdefault('n_blocks', 24)
     args.setdefault('n_heads', 32)
@@ -31,9 +33,35 @@ def main(**args):
     args.setdefault('sampling_timesteps', 4096)
     args.setdefault('score_temp', 0.9)
     args.setdefault('output_scale', 1.)
-    args.setdefault('owt2_tokenizer', True)
+    args.setdefault('owt2_tokenizer', None)  # None means auto-detect from checkpoint
+    args.setdefault('tokenizer_name', 'google-bert/bert-base-uncased')
     args.setdefault('ddim_sampler', False)
     args.setdefault('guidance_weight', 2.)
+    
+    # Determine checkpoint directory
+    if args.checkpoint_dir is None:
+        if args.weights_path is None:
+            raise ValueError("Either checkpoint_dir or weights_path must be provided")
+        args.checkpoint_dir = args.weights_path
+    # Convert to absolute path
+    if not os.path.isabs(args.checkpoint_dir):
+        args.checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+    
+    # Auto-detect tokenizer type from checkpoint if not specified
+    if args.owt2_tokenizer is None:
+        tokenizer_type_file = os.path.join(args.checkpoint_dir, 'tokenizer_type.txt')
+        if os.path.exists(tokenizer_type_file):
+            with open(tokenizer_type_file, 'r') as f:
+                lines = f.readlines()
+                tokenizer_type = lines[0].strip() if len(lines) > 0 else 'owt2'
+                if len(lines) > 1:
+                    args.tokenizer_name = lines[1].strip()
+            args.owt2_tokenizer = (tokenizer_type != 'bert')
+            print(f'Auto-detected tokenizer type: {tokenizer_type}, tokenizer_name: {args.tokenizer_name}')
+        else:
+            # Default to BERT if no tokenizer_type.txt found
+            args.owt2_tokenizer = False
+            print(f'No tokenizer_type.txt found, defaulting to BERT tokenizer: {args.tokenizer_name}')
 
     lib.utils.print_args(args)
 
@@ -45,6 +73,65 @@ def main(**args):
     # everything in fp64 by default and explicitly switch to fp32/bf16 where
     # appropriate.
     torch.set_default_dtype(torch.float64)
+
+    # Initialize tokenizer early to get vocab_size
+    if args.owt2_tokenizer:
+        tokenizer = lib.datasets.openwebtext2_tokenizer()
+        print('Using OWT2 tokenizer')
+        if args.vocab_size is None:
+            args.vocab_size = 32768  # OWT2 default vocab_size
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.tokenizer_name,
+            trust_remote_code=True,
+        )
+        # Ensure pad_token is set for BERT
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            elif tokenizer.unk_token is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+                tokenizer.pad_token_id = tokenizer.unk_token_id
+        print(f'Using BERT tokenizer: {args.tokenizer_name}')
+        # Get vocab_size from tokenizer
+        if args.vocab_size is None:
+            args.vocab_size = len(tokenizer.get_vocab())
+            print(f'Auto-detected vocab_size from tokenizer: {args.vocab_size}')
+    
+    # Try to get vocab_size from checkpoint config.json if available
+    if args.weights_path is not None:
+        config_file = os.path.join(args.checkpoint_dir, 'config.json')
+        if os.path.exists(config_file):
+            try:
+                import json
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    if 'vocab_size' in config:
+                        checkpoint_vocab_size = config['vocab_size']
+                        if args.vocab_size is not None and args.vocab_size != checkpoint_vocab_size:
+                            print(f'Warning: vocab_size mismatch. Tokenizer: {args.vocab_size}, Checkpoint: {checkpoint_vocab_size}. Using checkpoint vocab_size.')
+                        args.vocab_size = checkpoint_vocab_size
+                        print(f'Using vocab_size from checkpoint config: {args.vocab_size}')
+            except Exception as e:
+                print(f'Warning: Failed to read vocab_size from config.json: {e}')
+    
+    # Final fallback: try to infer from embedding_matrix checkpoint
+    if args.vocab_size is None and args.weights_path is not None:
+        embedding_file = os.path.join(args.weights_path, 'embedding_matrix.pt')
+        if os.path.exists(embedding_file):
+            try:
+                embedding_state = torch.load(embedding_file, map_location='cpu')
+                if 'matrix' in embedding_state:
+                    args.vocab_size = embedding_state['matrix'].shape[0]
+                    print(f'Auto-detected vocab_size from embedding_matrix checkpoint: {args.vocab_size}')
+            except Exception as e:
+                print(f'Warning: Failed to infer vocab_size from embedding_matrix: {e}')
+    
+    # Final fallback to default
+    if args.vocab_size is None:
+        args.vocab_size = 32768
+        print(f'Warning: Using default vocab_size: {args.vocab_size}')
 
     def log1mexp(x):
         # Computes log(1-exp(-|x|))
@@ -184,32 +271,34 @@ def main(**args):
 
             return x_samples
 
-    def print_samples(x_samples):
+    def decode_samples(x_samples):
+        """Decode samples and return list of text strings"""
+        decoded_texts = []
         if args.owt2_tokenizer:
-            owt2_tokenizer = lib.datasets.openwebtext2_tokenizer()
             for x in x_samples:
-                x = owt2_tokenizer.decode(x.tolist(), skip_special_tokens=False)
-                print(x.replace("\n", "↵"))
+                x = tokenizer.decode(x.tolist(), skip_special_tokens=False)
+                decoded_texts.append(x)
         else:
+            # Use BERT tokenizer
             for x in x_samples:
-                x = x.tolist()
-                x = [idx2word[i].decode('utf-8', 'ignore') for i in x]
-                x = ' '.join(x)
-                x = x.replace('START','')
-                x = x.replace('END','')
-                x = x.replace('PAD','')
-                x = x.replace(' .', '.')
-                x = x.replace(' !', '!')
-                x = x.replace(' ,', ',')
-                x = x.replace(' \' ', '\'')
-                x = x.strip()
-                # replace newlines with '↵' symbol for cleaner printing
-                print(x.replace("\n", "↵"))
-
-    tokenizer = lib.datasets.openwebtext2_tokenizer()
+                token_ids = x.tolist()
+                decoded_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+                decoded_texts.append(decoded_text)
+        return decoded_texts
+    
+    def print_samples(x_samples):
+        """Print samples (for backward compatibility)"""
+        decoded_texts = decode_samples(x_samples)
+        for text in decoded_texts:
+            print(text.replace("\n", "↵"))
+        return decoded_texts
+    
+    # Collect all samples for saving to file
+    all_samples = []
 
     print('Unconditional:')
-    print_samples(generate_samples([], seq_len=1024))
+    samples = print_samples(generate_samples([], seq_len=1024))
+    all_samples.append(('Unconditional', samples))
     print("\n"*10)
 
     prefixes = [
@@ -218,73 +307,139 @@ def main(**args):
     ]
     for prefix in prefixes:
         print('Prefix completion: ', prefix)
-        prefix = tokenizer.encode(prefix).ids
-        print_samples(generate_samples(
-            [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix)]
+        if args.owt2_tokenizer:
+            prefix_tokens = tokenizer.encode(prefix).ids
+        else:
+            prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        samples = print_samples(generate_samples(
+            [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix_tokens)]
         ))
+        all_samples.append((f'Prefix completion: {prefix}', samples))
         print("\n"*10)
 
     print('Infilling: A year ago in Paris, [...] Wow, what a great day!')
-    tokenizer = lib.datasets.openwebtext2_tokenizer()
-    prefix = tokenizer.encode(' A year ago in Paris,').ids
-    suffix = tokenizer.encode('. Wow, what a great day!').ids
+    if args.owt2_tokenizer:
+        prefix = tokenizer.encode(' A year ago in Paris,').ids
+        suffix = tokenizer.encode('. Wow, what a great day!').ids
+    else:
+        prefix = tokenizer.encode(' A year ago in Paris,', add_special_tokens=False)
+        suffix = tokenizer.encode('. Wow, what a great day!', add_special_tokens=False)
     infill_len = 40
-    print_samples(generate_samples(
+    samples = print_samples(generate_samples(
         [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix)]
         + [(token, args.guidance_weight, position + len(prefix) + infill_len, False) for position, token in enumerate(suffix)]
     ))
+    all_samples.append(('Infilling: A year ago in Paris, [...] Wow, what a great day!', samples))
     print("\n"*10)
 
     print('Word-level weights: Let\'s talk about law[10] and medicine[1].')
-    guidance = [
-        (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
-        (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
-        (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
-        (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
-        (tokenizer.encode(' law').ids,      10.,                    4,  False),
-        (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
-        (tokenizer.encode(' medicine').ids, args.guidance_weight,   6,  False),
-        (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
-    ]
+    if args.owt2_tokenizer:
+        guidance = [
+            (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
+            (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
+            (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
+            (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
+            (tokenizer.encode(' law').ids,      10.,                    4,  False),
+            (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
+            (tokenizer.encode(' medicine').ids, args.guidance_weight,   6,  False),
+            (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
+        ]
+    else:
+        guidance = [
+            (tokenizer.encode(' Let', add_special_tokens=False),      args.guidance_weight,   0,  False),
+            (tokenizer.encode('\'s', add_special_tokens=False),       args.guidance_weight,   1,  False),
+            (tokenizer.encode(' talk', add_special_tokens=False),     args.guidance_weight,   2,  False),
+            (tokenizer.encode(' about', add_special_tokens=False),    args.guidance_weight,   3,  False),
+            (tokenizer.encode(' law', add_special_tokens=False),      10.,                    4,  False),
+            (tokenizer.encode(' and', add_special_tokens=False),      args.guidance_weight,   5,  False),
+            (tokenizer.encode(' medicine', add_special_tokens=False), args.guidance_weight,   6,  False),
+            (tokenizer.encode('.', add_special_tokens=False),         args.guidance_weight,   7,  False),
+        ]
     assert(all(len(a) == 1 for a,_,_,_ in guidance))
     guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
+    samples = print_samples(generate_samples(guidance))
+    all_samples.append(('Word-level weights: Let\'s talk about law[10] and medicine[1].', samples))
     print('\n'*10)
 
     print('Word-level weights: Let\'s talk about law[1] and medicine[10].')
-    guidance = [
-        (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
-        (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
-        (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
-        (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
-        (tokenizer.encode(' law').ids,      args.guidance_weight,   4,  False),
-        (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
-        (tokenizer.encode(' medicine').ids, 10.,                    6,  False),
-        (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
-    ]
+    if args.owt2_tokenizer:
+        guidance = [
+            (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
+            (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
+            (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
+            (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
+            (tokenizer.encode(' law').ids,      args.guidance_weight,   4,  False),
+            (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
+            (tokenizer.encode(' medicine').ids, 10.,                    6,  False),
+            (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
+        ]
+    else:
+        guidance = [
+            (tokenizer.encode(' Let', add_special_tokens=False),      args.guidance_weight,   0,  False),
+            (tokenizer.encode('\'s', add_special_tokens=False),       args.guidance_weight,   1,  False),
+            (tokenizer.encode(' talk', add_special_tokens=False),     args.guidance_weight,   2,  False),
+            (tokenizer.encode(' about', add_special_tokens=False),    args.guidance_weight,   3,  False),
+            (tokenizer.encode(' law', add_special_tokens=False),      args.guidance_weight,   4,  False),
+            (tokenizer.encode(' and', add_special_tokens=False),      args.guidance_weight,   5,  False),
+            (tokenizer.encode(' medicine', add_special_tokens=False), 10.,                    6,  False),
+            (tokenizer.encode('.', add_special_tokens=False),         args.guidance_weight,   7,  False),
+        ]
     assert(all(len(a) == 1 for a,_,_,_ in guidance))
     guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
+    samples = print_samples(generate_samples(guidance))
+    all_samples.append(('Word-level weights: Let\'s talk about law[1] and medicine[10].', samples))
     print('\n'*10)
 
     print(f'Lexically constrained generation: Donald')
-    guidance = [
-        (tokenizer.encode(' Donald').ids, 3., 'any', False),
-    ]
+    if args.owt2_tokenizer:
+        guidance = [
+            (tokenizer.encode(' Donald').ids, 3., 'any', False),
+        ]
+    else:
+        guidance = [
+            (tokenizer.encode(' Donald', add_special_tokens=False), 3., 'any', False),
+        ]
     assert(all(len(a) == 1 for a,_,_,_ in guidance))
     guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
+    samples = print_samples(generate_samples(guidance))
+    all_samples.append(('Lexically constrained generation: Donald', samples))
     print("\n"*10)
 
     print(f'Negation: Donald but not Trump')
-    guidance = [
-        (tokenizer.encode(' Donald').ids, 3., 'any', False),
-        (tokenizer.encode(' Trump').ids, 10., 'all', True),
-    ]
+    if args.owt2_tokenizer:
+        guidance = [
+            (tokenizer.encode(' Donald').ids, 3., 'any', False),
+            (tokenizer.encode(' Trump').ids, 10., 'all', True),
+        ]
+    else:
+        guidance = [
+            (tokenizer.encode(' Donald', add_special_tokens=False), 3., 'any', False),
+            (tokenizer.encode(' Trump', add_special_tokens=False), 10., 'all', True),
+        ]
     assert(all(len(a) == 1 for a,_,_,_ in guidance))
     guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
+    samples = print_samples(generate_samples(guidance))
+    all_samples.append(('Negation: Donald but not Trump', samples))
     print("\n"*10)
+    
+    # Save all samples to file
+    output_file = os.path.join(args.checkpoint_dir, 'samples.txt')
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("Generated Samples\n")
+            f.write("=" * 80 + "\n\n")
+            for title, sample_texts in all_samples:
+                f.write(f"{title}\n")
+                f.write("-" * 80 + "\n")
+                for i, text in enumerate(sample_texts, 1):
+                    f.write(f"\nSample {i}:\n")
+                    f.write(text)
+                    f.write("\n\n")
+                f.write("\n" + "=" * 80 + "\n\n")
+        print(f'Saved all samples to {output_file}')
+    except Exception as e:
+        print(f'Warning: Failed to save samples to file: {e}')
 
 
 if __name__ == '__main__':
