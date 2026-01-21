@@ -11,6 +11,29 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn, optim
 
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func as _fa_qkvpacked
+except ImportError:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa_qkvpacked
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6, affine=True):
+        super().__init__()
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x):
+        # x: (..., dim)
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        x = x / rms
+        if self.weight is not None:
+            x = x * self.weight
+        return x
+
 class LayerNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -41,11 +64,13 @@ class TransformerBlock(nn.Module):
         self.n_heads = n_heads
         self.residual_scale = residual_scale
 
-        self.rmsnorm1 = apex.normalization.FusedRMSNorm(dim)
+        # self.rmsnorm1 = apex.normalization.FusedRMSNorm(dim)
+        self.rmsnorm1 = RMSNorm(dim)
         self.attn_qkv = nn.Linear(dim, 3*dim, bias=False)
         self.attn_out = nn.Linear(dim, dim, bias=False)
 
-        self.rmsnorm2 = apex.normalization.FusedRMSNorm(dim)
+        # self.rmsnorm2 = apex.normalization.FusedRMSNorm(dim)
+        self.rmsnorm2 = RMSNorm(dim)
         self.mlp = flash_attn.ops.fused_dense.FusedMLP(
             dim, 4*dim, bias1=False, bias2=False, checkpoint_lvl=1)
 
@@ -73,7 +98,7 @@ class TransformerBlock(nn.Module):
                 0, (batch_size + 1) * seq_len, step=seq_len,
                 dtype=torch.int32, device=qkv.device
             )
-        x = flash_attn.flash_attn_interface.flash_attn_unpadded_qkvpacked_func(
+        x = _fa_qkvpacked(
             qkv, cu_seqlens, seq_len, 0., causal=self.causal)
         x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
         x = residual_linear(
@@ -233,7 +258,8 @@ class AutoregressiveModel(nn.Module):
             TransformerBlock(dim, n_heads, True, residual_scale)
             for i in range(n_blocks)
         ])
-        self.output_norm = apex.normalization.FusedRMSNorm(dim)
+        # self.output_norm = apex.normalization.FusedRMSNorm(dim)
+        self.output_norm = RMSNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
         self.first_token_logits = nn.Parameter(torch.zeros(vocab_size))
 
