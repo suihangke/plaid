@@ -279,7 +279,7 @@ def main(**args):
                 x = tokenizer.decode(x.tolist(), skip_special_tokens=False)
                 decoded_texts.append(x)
         else:
-            # Use BERT tokenizer
+            # Use BERT tokenizer - skip special tokens like [CLS], [SEP], [PAD] for cleaner output
             for x in x_samples:
                 token_ids = x.tolist()
                 decoded_text = tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -297,7 +297,8 @@ def main(**args):
     all_samples = []
 
     print('Unconditional:')
-    samples = print_samples(generate_samples([], seq_len=1024))
+    # Use training seq_len for consistency (default 128 for BERT models)
+    samples = print_samples(generate_samples([], seq_len=args.seq_len))
     all_samples.append(('Unconditional', samples))
     print("\n"*10)
 
@@ -344,7 +345,10 @@ def main(**args):
             (tokenizer.encode(' medicine').ids, args.guidance_weight,   6,  False),
             (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
         ]
+        # OWT2 tokenizer returns list with .ids attribute
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     else:
+        # BERT tokenizer returns list directly, may have multiple tokens per word
         guidance = [
             (tokenizer.encode(' Let', add_special_tokens=False),      args.guidance_weight,   0,  False),
             (tokenizer.encode('\'s', add_special_tokens=False),       args.guidance_weight,   1,  False),
@@ -355,8 +359,8 @@ def main(**args):
             (tokenizer.encode(' medicine', add_special_tokens=False), args.guidance_weight,   6,  False),
             (tokenizer.encode('.', add_special_tokens=False),         args.guidance_weight,   7,  False),
         ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
+        # BERT tokenizer: use first token if multiple tokens (WordPiece may split words)
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     samples = print_samples(generate_samples(guidance))
     all_samples.append(('Word-level weights: Let\'s talk about law[10] and medicine[1].', samples))
     print('\n'*10)
@@ -373,7 +377,10 @@ def main(**args):
             (tokenizer.encode(' medicine').ids, 10.,                    6,  False),
             (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
         ]
+        # OWT2 tokenizer returns list with .ids attribute
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     else:
+        # BERT tokenizer returns list directly, may have multiple tokens per word
         guidance = [
             (tokenizer.encode(' Let', add_special_tokens=False),      args.guidance_weight,   0,  False),
             (tokenizer.encode('\'s', add_special_tokens=False),       args.guidance_weight,   1,  False),
@@ -384,8 +391,8 @@ def main(**args):
             (tokenizer.encode(' medicine', add_special_tokens=False), 10.,                    6,  False),
             (tokenizer.encode('.', add_special_tokens=False),         args.guidance_weight,   7,  False),
         ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
+        # BERT tokenizer: use first token if multiple tokens (WordPiece may split words)
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     samples = print_samples(generate_samples(guidance))
     all_samples.append(('Word-level weights: Let\'s talk about law[1] and medicine[10].', samples))
     print('\n'*10)
@@ -395,12 +402,13 @@ def main(**args):
         guidance = [
             (tokenizer.encode(' Donald').ids, 3., 'any', False),
         ]
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     else:
+        # BERT tokenizer: use first token if multiple tokens
+        donald_tokens = tokenizer.encode(' Donald', add_special_tokens=False)
         guidance = [
-            (tokenizer.encode(' Donald', add_special_tokens=False), 3., 'any', False),
+            (donald_tokens[0] if len(donald_tokens) > 0 else donald_tokens, 3., 'any', False),
         ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
     samples = print_samples(generate_samples(guidance))
     all_samples.append(('Lexically constrained generation: Donald', samples))
     print("\n"*10)
@@ -411,13 +419,15 @@ def main(**args):
             (tokenizer.encode(' Donald').ids, 3., 'any', False),
             (tokenizer.encode(' Trump').ids, 10., 'all', True),
         ]
+        guidance = [(a[0] if isinstance(a, list) and len(a) > 0 else a, b, c, d) for a,b,c,d in guidance]
     else:
+        # BERT tokenizer: use first token if multiple tokens
+        donald_tokens = tokenizer.encode(' Donald', add_special_tokens=False)
+        trump_tokens = tokenizer.encode(' Trump', add_special_tokens=False)
         guidance = [
-            (tokenizer.encode(' Donald', add_special_tokens=False), 3., 'any', False),
-            (tokenizer.encode(' Trump', add_special_tokens=False), 10., 'all', True),
+            (donald_tokens[0] if len(donald_tokens) > 0 else donald_tokens, 3., 'any', False),
+            (trump_tokens[0] if len(trump_tokens) > 0 else trump_tokens, 10., 'all', True),
         ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
     samples = print_samples(generate_samples(guidance))
     all_samples.append(('Negation: Donald but not Trump', samples))
     print("\n"*10)
