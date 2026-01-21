@@ -14,3 +14,7 @@ samples.txt
 *.png
 *.jpg
 *.pdf
+
+# external repos
+apex/
+flash-attention/
