@@ -1,5 +1,6 @@
 import contextlib
 import fire
+import json
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import mup
@@ -18,9 +19,47 @@ import torch.distributed.optim
 import torch.nn.functional as F
 import tqdm
 import transformers
+import wandb
 from torch import nn, optim, autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
 from standalone_dataset_fix1 import DatasetConfig, get_dataloader
+
+# Global flag to track if wandb is still working
+_wandb_working = True
+
+def safe_wandb_log(data, step=None, commit=None):
+    """
+    Safely log to wandb, catching all errors to prevent training interruption.
+    Returns True if successful, False otherwise.
+    """
+    global _wandb_working
+    if not _wandb_working:
+        return False
+    
+    try:
+        if step is not None and commit is not None:
+            wandb.log(data, step=step, commit=commit)
+        elif step is not None:
+            wandb.log(data, step=step)
+        elif commit is not None:
+            wandb.log(data, commit=commit)
+        else:
+            wandb.log(data)
+        return True
+    except (OSError, BrokenPipeError, IOError) as e:
+        # Disk space issues, connection issues, etc.
+        if _wandb_working:
+            print(f"Warning: wandb logging failed (disk space or connection issue): {e}")
+            print("Continuing training without wandb logging...")
+            _wandb_working = False
+        return False
+    except Exception as e:
+        # Any other unexpected error
+        if _wandb_working:
+            print(f"Warning: wandb logging failed with unexpected error: {e}")
+            print("Continuing training without wandb logging...")
+            _wandb_working = False
+        return False
 
 def count_non_embedding_params(modules):
     """Count parameters excluding embedding_matrix"""
@@ -74,6 +113,14 @@ def main(**args):
     args.setdefault('final_val_steps', 3000)
     args.setdefault('tokenizer_name', 'google-bert/bert-base-uncased')  # BERT tokenizer for LM1B
     args.setdefault('checkpoint_dir', 'checkpoints_bert')  # Checkpoint directory to distinguish from GPT2 version
+    args.setdefault('use_wandb', True)
+    args.setdefault('wandb_project', 'plaid-lm1b')
+    args.setdefault('wandb_name', None)
+    args.setdefault('wandb_id', None)  # Wandb run ID to resume from (if None, creates new run)
+    args.setdefault('wandb_resume', 'never')  # Wandb resume mode: 'never', 'allow', or 'must'
+    args.setdefault('resume_from_checkpoint', None)  # Path to checkpoint directory to resume from
+    args.setdefault('resume_from_step', None)  # Step number to resume from (if None, read from step file)
+    args.setdefault('save_milestone_dir', None)  # Directory to save milestone checkpoints (e.g., /data/users/hangkes2/edlm/)
 
     lib.utils.print_args(args)
 
@@ -88,6 +135,27 @@ def main(**args):
     
     # Set device for CUDA operations
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Initialize wandb (only on rank 0 to avoid redundant logging)
+    if args.use_wandb and lib.ddp.rank() == 0:
+        try:
+            wandb_kwargs = {
+                'project': args.wandb_project,
+                'name': args.wandb_name,
+                'config': dict(args),
+                'reinit': True
+            }
+            # Add resume options if specified
+            if args.wandb_id is not None:
+                wandb_kwargs['id'] = args.wandb_id
+                wandb_kwargs['resume'] = args.wandb_resume
+                print(f'Resuming wandb run with ID: {args.wandb_id}, resume mode: {args.wandb_resume}')
+            wandb.init(**wandb_kwargs)
+        except (OSError, IOError, Exception) as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+            print("Continuing training without wandb logging...")
+            args.use_wandb = False
+            _wandb_working = False
 
     # Initialize BERT tokenizer for LM1B
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -195,9 +263,39 @@ def main(**args):
 
     # Create checkpoint directory if it doesn't exist
     checkpoint_dir = args.checkpoint_dir
+    # Convert to absolute path to ensure consistent location
+    if not os.path.isabs(checkpoint_dir):
+        checkpoint_dir = os.path.abspath(checkpoint_dir)
+    # Create directory (only on rank 0 to avoid race conditions)
     if lib.ddp.rank() == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-    # Synchronize all processes to ensure directory is created
+        try:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print(f'Checkpoint directory: {checkpoint_dir}')
+            
+            # Save training configuration to checkpoint directory
+            config_file = os.path.join(checkpoint_dir, 'config.json')
+            # Convert args to a serializable dictionary
+            config_dict = {}
+            for key, value in args.items():
+                # Convert non-serializable types to strings or basic types
+                if isinstance(value, (int, float, str, bool, type(None))):
+                    config_dict[key] = value
+                elif isinstance(value, (list, tuple)):
+                    config_dict[key] = list(value) if isinstance(value, tuple) else value
+                else:
+                    # For other types (like torch.device, etc.), convert to string
+                    config_dict[key] = str(value)
+            
+            with open(config_file, 'w') as f:
+                json.dump(config_dict, f, indent=2, sort_keys=True)
+            print(f'Saved training config to {config_file}')
+        except OSError as e:
+            print(f'Warning: Failed to create checkpoint directory {checkpoint_dir}: {e}')
+            raise
+        except Exception as e:
+            print(f'Warning: Failed to save config file: {e}')
+            # Don't raise here, as config saving is not critical for training
+    # Synchronize all processes to ensure directory is created before proceeding
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     
@@ -221,7 +319,27 @@ def main(**args):
     # Check if any model checkpoint exists (e.g., model.pt, noise_schedule.pt, etc.)
     model_file = os.path.join(checkpoint_dir, 'model.pt')
     
-    if args.auto_resume and os.path.exists(step_file):
+    # Priority: resume_from_checkpoint > auto_resume > weights_path
+    if args.resume_from_checkpoint is not None:
+        # Load from specified checkpoint directory
+        resume_dir = args.resume_from_checkpoint
+        if not os.path.isabs(resume_dir):
+            resume_dir = os.path.abspath(resume_dir)
+        print(f'Resuming from checkpoint directory: {resume_dir}')
+        load_weights(resume_dir)
+        if args.resume_from_step is not None:
+            first_step = args.resume_from_step
+            print(f'Resuming from step {first_step} (specified by resume_from_step)')
+        else:
+            # Try to read step from step file in resume directory
+            resume_step_file = os.path.join(resume_dir, 'step')
+            if os.path.exists(resume_step_file):
+                with open(resume_step_file, 'r') as f:
+                    first_step = int(f.read()) + 1
+                print(f'Resumed from checkpoint at step {first_step - 1} in {resume_dir}/')
+            else:
+                print(f'Warning: step file not found in {resume_dir}, starting from step {first_step}')
+    elif args.auto_resume and os.path.exists(step_file):
         # Check if at least one model file exists
         checkpoint_exists = any(
             os.path.exists(os.path.join(checkpoint_dir, f'{name}.pt'))
@@ -241,7 +359,7 @@ def main(**args):
 
     ddp_modules = {
         name: DDP(module, broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,  # Set to False for better performance if all parameters are used
             gradient_as_bucket_view=True
         )
         for name, module in modules.items()
@@ -287,7 +405,11 @@ def main(**args):
                 reconst_std   = (b*reconst_sqr_ema   - (b*reconst_ema)**2).clamp(min=0).sqrt()
                 diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
                 reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
-                reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
+                # Ensure reconst_bs is between 1 and batch_size-1 (at least 1 for reconst, at least 1 for diffusion)
+                reconst_bs = int(reconst_bs.round().clamp(1, max(1, batch_size-1)))
+                # Double-check to ensure we have at least 1 for diffusion
+                if reconst_bs >= batch_size:
+                    reconst_bs = max(1, batch_size - 1)
                 reconst_bs_cache[step] = reconst_bs
             reconst_bs = reconst_bs_cache[step]
             avg_reconst_bs = float(reconst_bs)
@@ -296,6 +418,8 @@ def main(**args):
             batch_size = x.shape[0]
             reconst_bs = (batch_size // 8)
             reconst_bs += int(np.random.binomial(1, (batch_size % 8) / 8.))
+            # Ensure we have at least 1 for diffusion
+            reconst_bs = min(reconst_bs, max(1, batch_size - 1))
             avg_reconst_bs = batch_size / 8.
 
         embedding_matrix = ddp_modules['embedding_matrix']()
@@ -315,13 +439,18 @@ def main(**args):
         # First entries of t are used for reconst_loss below
         t[:reconst_bs] = 0
         # Low-discrepancy sampler for the remaining entries of t
-        t[reconst_bs:] = torch.arange(
-            batch_size - reconst_bs, device=device)
-        if train_mode:
-            t[reconst_bs:] += float(np.random.RandomState(step).uniform())
+        # Ensure we have at least 1 entry for diffusion loss
+        diffusion_size = max(1, batch_size - reconst_bs)
+        if diffusion_size > 0:
+            t[reconst_bs:] = torch.arange(diffusion_size, device=device)
+            if train_mode:
+                t[reconst_bs:] += float(np.random.RandomState(step).uniform())
+            else:
+                t[reconst_bs:] += float(np.random.uniform())
+            t[reconst_bs:] /= diffusion_size
         else:
-            t[reconst_bs:] += float(np.random.uniform())
-        t[reconst_bs:] /= batch_size - reconst_bs
+            # Edge case: all samples are reconstruction (shouldn't happen, but handle it)
+            t[reconst_bs:] = 0
         t.requires_grad = True
 
         if train_mode:
@@ -468,6 +597,37 @@ def main(**args):
             nll += diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)
             nll += prior_loss
 
+        # Log training metrics to wandb every step (only on rank 0, only in train mode, only at last accum step)
+        if train_mode and step is not None and args.use_wandb and lib.ddp.rank() == 0:
+            # Only log at the last accumulation step to avoid duplicate logs
+            if accum_total is not None and accum_total > 0:
+                world_size = lib.ddp.world_size()
+                local_accum = accum_step // world_size
+                grad_accum_steps = accum_total // world_size
+                is_last_accum = (local_accum == (grad_accum_steps - 1))
+            else:
+                is_last_accum = True
+            
+            if is_last_accum:
+                # Extract scalar values from tensors
+                loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
+                nll_val = nll.item() if isinstance(nll, torch.Tensor) else nll
+                reconst_val = (reconst_loss.sum() / avg_reconst_bs).item() if isinstance(reconst_loss, torch.Tensor) else (reconst_loss.sum() / avg_reconst_bs)
+                prior_val = prior_loss.item() if isinstance(prior_loss, torch.Tensor) else prior_loss
+                gamma_0_val = gamma_0.item() if isinstance(gamma_0, torch.Tensor) else gamma_0
+                gamma_1_val = gamma_1.item() if isinstance(gamma_1, torch.Tensor) else gamma_1
+                reconst_bs_val = reconst_bs if isinstance(reconst_bs, (int, float)) else reconst_bs.item()
+                
+                safe_wandb_log({
+                    'train/loss': loss_val,
+                    'train/nll': nll_val,
+                    'train/reconst': reconst_val,
+                    'train/prior': prior_val,
+                    'train/gamma_0': gamma_0_val,
+                    'train/gamma_1': gamma_1_val,
+                    'train/reconst_bs': reconst_bs_val,
+                }, step=step, commit=True)
+
         return (
             loss,
             nll,
@@ -545,12 +705,28 @@ def main(**args):
             ema.step()
 
         if step % args.hook_freq == (args.hook_freq - 1):
-            val_nll = compute_nll(val_iterator, args.val_steps)
-            print(f'NLL (val, seq_len={args.seq_len}): {val_nll}')
-            all_val_nlls.append(val_nll)
-            if args.seq_len != 256:
-                val_nll_256 = compute_nll(val_iterator, args.val_steps, seq_len=256)
-                print(f'NLL (val, seq_len=256): {val_nll_256}')
+            # Always compute val_nll for both seq_len=128 and seq_len=256
+            val_nll_128 = compute_nll(val_iterator, args.val_steps, seq_len=128)
+            val_nll_256 = compute_nll(val_iterator, args.val_steps, seq_len=256)
+            
+            print(f'NLL (val, seq_len=128): {val_nll_128}')
+            print(f'NLL (val, seq_len=256): {val_nll_256}')
+            
+            # Append the one matching current seq_len to all_val_nlls
+            if args.seq_len == 128:
+                all_val_nlls.append(val_nll_128)
+            elif args.seq_len == 256:
+                all_val_nlls.append(val_nll_256)
+            else:
+                all_val_nlls.append(val_nll_128)  # Default to 128
+
+            # Log validation metrics to wandb (only on rank 0)
+            if args.use_wandb and lib.ddp.rank() == 0:
+                log_dict = {
+                    'val/nll_seq128': val_nll_128,
+                    'val/nll_seq256': val_nll_256,
+                }
+                safe_wandb_log(log_dict, step=step, commit=False)
 
             if lib.ddp.rank() == 0:
                 # Save weights to checkpoint directory with _bert suffix
@@ -567,6 +743,29 @@ def main(**args):
                     with open(marker_file, 'w') as f:
                         f.write(f'bert\n{args.tokenizer_name}\n')
                     print(f'Saved weights to {checkpoint_dir}/ at step {step}!')
+                
+                # Save milestone checkpoints to specified directory (e.g., every 100k steps)
+                if args.save_milestone_dir is not None:
+                    milestone_steps = [500_000, 600_000, 700_000, 800_000, 900_000, 1_000_000]
+                    if step in milestone_steps:
+                        milestone_dir = os.path.join(args.save_milestone_dir, f'checkpoints_bert_768_12_12_{step//1000}k')
+                        os.makedirs(milestone_dir, exist_ok=True)
+                        print(f'Saving milestone checkpoint at step {step} to {milestone_dir}/')
+                        for name in modules:
+                            with emas[name].enabled():
+                                milestone_file = os.path.join(milestone_dir, f'{name}.pt')
+                                torch.save(modules[name].state_dict(), milestone_file)
+                        milestone_step_file = os.path.join(milestone_dir, 'step')
+                        with open(milestone_step_file, 'w') as f:
+                            f.write(str(step))
+                        # Save config and marker files
+                        milestone_config_file = os.path.join(milestone_dir, 'config.json')
+                        with open(milestone_config_file, 'w') as f:
+                            json.dump(dict(args), f, indent=2)
+                        milestone_marker_file = os.path.join(milestone_dir, 'tokenizer_type.txt')
+                        with open(milestone_marker_file, 'w') as f:
+                            f.write(f'bert\n{args.tokenizer_name}\n')
+                        print(f'Milestone checkpoint saved to {milestone_dir}/ at step {step}!')
 
                 # Save gamma plot to checkpoint directory
                 t = torch.linspace(0., 1., 1024, device=device)
@@ -578,6 +777,13 @@ def main(**args):
                 plt.title(f'Noise Schedule (step {step}, BERT)')
                 gamma_file = os.path.join(checkpoint_dir, f'gamma_{step}.jpg')
                 plt.savefig(gamma_file)
+                
+                # Upload gamma plot to wandb (only on rank 0)
+                if args.use_wandb:
+                    safe_wandb_log({
+                        'gamma_plot': wandb.Image(gamma_file)
+                    }, step=step, commit=True)
+                
                 plt.close()
 
     print('Starting train loop...')
@@ -602,11 +808,18 @@ def main(**args):
         clip_quantile=args.clip_quantile,
     )
 
-    final_val_nll = compute_nll(val_iterator, args.final_val_steps)
-    print('Final val NLL:', final_val_nll)
-    if args.seq_len != 256:
-        final_val_nll_256 = compute_nll(val_iterator, args.final_val_steps, seq_len=256)
-        print('Final val NLL (seq_len=256):', final_val_nll_256)
+    # Always compute final val_nll for both seq_len=128 and seq_len=256
+    final_val_nll_128 = compute_nll(val_iterator, args.final_val_steps, seq_len=128)
+    final_val_nll_256 = compute_nll(val_iterator, args.final_val_steps, seq_len=256)
+    print('Final val NLL (seq_len=128):', final_val_nll_128)
+    print('Final val NLL (seq_len=256):', final_val_nll_256)
+    
+    # Log final validation metrics to wandb (only on rank 0)
+    if args.use_wandb and lib.ddp.rank() == 0:
+        safe_wandb_log({
+            'val/final_nll_seq128': final_val_nll_128,
+            'val/final_nll_seq256': final_val_nll_256,
+        }, commit=True)
 
     # Save final checkpoint
     if lib.ddp.rank() == 0 and args.save_weights:
@@ -626,11 +839,52 @@ def main(**args):
             f.write(f'Final step: {final_step}\n')
             f.write(f'Model config: dim={args.dim}, n_blocks={args.n_blocks}, n_heads={args.n_heads}\n')
             f.write(f'Non-embedding params: {final_non_embedding:,}\n')
-            f.write(f'Final val NLL: {final_val_nll}\n')
-            if args.seq_len != 256:
-                f.write(f'Final val NLL (seq_len=256): {final_val_nll_256}\n')
+            f.write(f'Final val NLL (seq_len=128): {final_val_nll_128}\n')
+            f.write(f'Final val NLL (seq_len=256): {final_val_nll_256}\n')
         print(f'Final checkpoint saved to {checkpoint_dir}/')
+        
+        # Also save final milestone checkpoint if milestone directory is specified
+        if args.save_milestone_dir is not None:
+            milestone_steps = [500_000, 600_000, 700_000, 800_000, 900_000, 1_000_000]
+            if final_step in milestone_steps:
+                milestone_dir = os.path.join(args.save_milestone_dir, f'checkpoints_bert_768_12_12_{final_step//1000}k')
+                os.makedirs(milestone_dir, exist_ok=True)
+                print(f'Saving final milestone checkpoint at step {final_step} to {milestone_dir}/')
+                for name in modules:
+                    with emas[name].enabled():
+                        milestone_file = os.path.join(milestone_dir, f'{name}.pt')
+                        torch.save(modules[name].state_dict(), milestone_file)
+                milestone_step_file = os.path.join(milestone_dir, 'step')
+                with open(milestone_step_file, 'w') as f:
+                    f.write(str(final_step))
+                # Save config and marker files
+                milestone_config_file = os.path.join(milestone_dir, 'config.json')
+                with open(milestone_config_file, 'w') as f:
+                    json.dump(dict(args), f, indent=2)
+                milestone_marker_file = os.path.join(milestone_dir, 'tokenizer_type.txt')
+                with open(milestone_marker_file, 'w') as f:
+                    f.write(f'bert\n{args.tokenizer_name}\n')
+                # Save final model info
+                milestone_info_file = os.path.join(milestone_dir, 'model_info.txt')
+                with open(milestone_info_file, 'w') as f:
+                    f.write(f'Tokenizer: {args.tokenizer_name}\n')
+                    f.write(f'Final step: {final_step}\n')
+                    f.write(f'Model config: dim={args.dim}, n_blocks={args.n_blocks}, n_heads={args.n_heads}\n')
+                    f.write(f'Non-embedding params: {final_non_embedding:,}\n')
+                    f.write(f'Final val NLL (seq_len=128): {final_val_nll_128}\n')
+                    f.write(f'Final val NLL (seq_len=256): {final_val_nll_256}\n')
+                print(f'Final milestone checkpoint saved to {milestone_dir}/ at step {final_step}!')
 
+    # Finish wandb run (only on rank 0)
+    if args.use_wandb and lib.ddp.rank() == 0 and _wandb_working:
+        try:
+            wandb.finish()
+        except (OSError, IOError, BrokenPipeError, Exception) as e:
+            print(f"Warning: Failed to finish wandb run: {e}")
+            # Non-critical, just continue
+
+    # Return validation NLLs: return the one matching current seq_len for compatibility
+    final_val_nll = final_val_nll_128 if args.seq_len == 128 else final_val_nll_256
     return all_val_nlls, final_val_nll
 
 if __name__ == '__main__':
