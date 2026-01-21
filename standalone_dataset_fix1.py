@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from typing import Optional
-import lightning as L
 
 import torch
 from datasets import load_dataset
@@ -188,8 +187,16 @@ class MultiDataset(torch.utils.data.Dataset):
 
         # Group texts if wrapping is enabled
         if wrap:
-            EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
-            BOS = self.tokenizer.encode(self.tokenizer.bos_token)[0]
+            # Handle both tokenizers.Tokenizer (OWT2) and HuggingFace tokenizers
+            from tokenizers import Tokenizer as TokenizersTokenizer
+            if isinstance(self.tokenizer, TokenizersTokenizer):
+                # For OWT2 tokenizer, use the token IDs we set up
+                EOS = self._eos_token_id
+                BOS = self._bos_token_id
+            else:
+                # For HuggingFace tokenizers
+                EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
+                BOS = self.tokenizer.encode(self.tokenizer.bos_token)[0]
             group_texts = functools.partial(
                 _group_texts, block_size=max_length, bos=BOS, eos=EOS, insert_special_tokens=self.insert_special_tokens
             )
@@ -209,40 +216,68 @@ class MultiDataset(torch.utils.data.Dataset):
 
     def _setup_tokenizer_for_wrapping(self):
         """Setup tokenizer for wrapped batches (from reference)"""
-        # Increase model_max_length to allow longer sequences during tokenization
-        # Since we'll chunk sequences later, we don't need to truncate here
-        if hasattr(self.tokenizer, 'model_max_length'):
-            # Set to a very large value to avoid truncation warnings
-            # The actual chunking will happen in _group_texts
-            self.tokenizer.model_max_length = 1_000_000  # Large enough for most texts
+        # Check if this is a tokenizers.Tokenizer (OWT2) or HuggingFace tokenizer
+        from tokenizers import Tokenizer as TokenizersTokenizer
+        is_tokenizers_lib = isinstance(self.tokenizer, TokenizersTokenizer)
         
-        # Ensure BOS/EOS tokens exist
-        if self.tokenizer.bos_token is None:
-            if self.tokenizer.cls_token is None:
-                raise AttributeError(f"Tokenizer must have a bos_token or cls_token: {self.tokenizer}")
-            self.tokenizer.bos_token = self.tokenizer.cls_token
-        if self.tokenizer.eos_token is None:
-            if self.tokenizer.sep_token is None:
-                raise AttributeError(f"Tokenizer must have a eos_token or sep_token: {self.tokenizer}")
-            self.tokenizer.eos_token = self.tokenizer.sep_token
-        if self.tokenizer.pad_token is None:
-            # Try to use eos_token as pad_token first
-            if self.tokenizer.eos_token is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        if is_tokenizers_lib:
+            # For tokenizers.Tokenizer (OWT2), we need to set up BOS/EOS token IDs
+            # OWT2 tokenizer typically uses token ID 0 for EOS
+            vocab = self.tokenizer.get_vocab()
+            # Try to find EOS token (usually token ID 0 or a special token)
+            if 0 in vocab.values():
+                # Find the token string for ID 0
+                for token_str, token_id in vocab.items():
+                    if token_id == 0:
+                        self._eos_token_str = token_str.decode('utf-8') if isinstance(token_str, bytes) else token_str
+                        self._eos_token_id = 0
+                        break
             else:
-                # Add a new pad token if eos_token is also not available
-                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-                self.tokenizer.pad_token_id = self.tokenizer.get_vocab()["[PAD]"]
+                # Fallback: use token ID 0 as EOS
+                self._eos_token_str = None
+                self._eos_token_id = 0
+            
+            # BOS token is typically not used in OWT2, but we'll use EOS as BOS for wrapping
+            self._bos_token_str = self._eos_token_str
+            self._bos_token_id = self._eos_token_id
+        else:
+            # For HuggingFace transformers tokenizers
+            # Increase model_max_length to allow longer sequences during tokenization
+            # Since we'll chunk sequences later, we don't need to truncate here
+            if hasattr(self.tokenizer, 'model_max_length'):
+                # Set to a very large value to avoid truncation warnings
+                # The actual chunking will happen in _group_texts
+                self.tokenizer.model_max_length = 1_000_000  # Large enough for most texts
+            
+            # Ensure BOS/EOS tokens exist
+            if not hasattr(self.tokenizer, 'bos_token') or self.tokenizer.bos_token is None:
+                if hasattr(self.tokenizer, 'cls_token') and self.tokenizer.cls_token is not None:
+                    self.tokenizer.bos_token = self.tokenizer.cls_token
+                else:
+                    raise AttributeError(f"Tokenizer must have a bos_token or cls_token: {self.tokenizer}")
+            if not hasattr(self.tokenizer, 'eos_token') or self.tokenizer.eos_token is None:
+                if hasattr(self.tokenizer, 'sep_token') and self.tokenizer.sep_token is not None:
+                    self.tokenizer.eos_token = self.tokenizer.sep_token
+                else:
+                    raise AttributeError(f"Tokenizer must have a eos_token or sep_token: {self.tokenizer}")
+            if not hasattr(self.tokenizer, 'pad_token') or self.tokenizer.pad_token is None:
+                # Try to use eos_token as pad_token first
+                if self.tokenizer.eos_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                else:
+                    # Add a new pad token if eos_token is also not available
+                    self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                    self.tokenizer.pad_token_id = self.tokenizer.get_vocab()["[PAD]"]
 
-        # GPT2 tokenizer setup from reference
-        if isinstance(self.tokenizer, transformers.GPT2TokenizerFast) or isinstance(
-            self.tokenizer, transformers.GPT2Tokenizer
-        ):
-            self.tokenizer._tokenizer.post_processor = tokenizers.processors.BertProcessing(
-                (self.tokenizer.bos_token, self.tokenizer.bos_token_id),
-                (self.tokenizer.eos_token, self.tokenizer.eos_token_id),
-            )
+            # GPT2 tokenizer setup from reference
+            if isinstance(self.tokenizer, transformers.GPT2TokenizerFast) or isinstance(
+                self.tokenizer, transformers.GPT2Tokenizer
+            ):
+                self.tokenizer._tokenizer.post_processor = tokenizers.processors.BertProcessing(
+                    (self.tokenizer.bos_token, self.tokenizer.bos_token_id),
+                    (self.tokenizer.eos_token, self.tokenizer.eos_token_id),
+                )
 
     def _apply_detokenizer(self, texts):
         """Apply detokenizer to list of texts"""
@@ -258,35 +293,71 @@ class MultiDataset(torch.utils.data.Dataset):
         if self.detokenizer is not None:
             texts = self._apply_detokenizer(texts)
 
-        # Set tokenizer padding/truncation
-        self.tokenizer.padding_side = "right"
-        self.tokenizer.truncation_side = "right"
+        # Check tokenizer type
+        from tokenizers import Tokenizer as TokenizersTokenizer
+        is_tokenizers_lib = isinstance(self.tokenizer, TokenizersTokenizer)
+
+        # Set tokenizer padding/truncation (only for HuggingFace tokenizers)
+        if not is_tokenizers_lib:
+            if hasattr(self.tokenizer, 'padding_side'):
+                self.tokenizer.padding_side = "right"
+            if hasattr(self.tokenizer, 'truncation_side'):
+                self.tokenizer.truncation_side = "right"
 
         if self.wrap:
             # Wrapped tokenization: add EOS only if insert_eos=True, BOS added later in group_texts
             # Explicitly disable truncation since we'll chunk sequences later
-            tokens = self.tokenizer(
-                texts, 
-                add_special_tokens=False, 
-                return_attention_mask=False, 
-                return_token_type_ids=False,
-                truncation=False,  # Don't truncate - we'll chunk later
-                padding=False,  # Don't pad - we'll handle this in grouping
-            )
+            if is_tokenizers_lib:
+                # For tokenizers.Tokenizer (OWT2), use encode_batch
+                tokenized = self.tokenizer.encode_batch(texts)
+                tokens = {"input_ids": [enc.ids for enc in tokenized]}
+            else:
+                # For HuggingFace tokenizers
+                tokens = self.tokenizer(
+                    texts, 
+                    add_special_tokens=False, 
+                    return_attention_mask=False, 
+                    return_token_type_ids=False,
+                    truncation=False,  # Don't truncate - we'll chunk later
+                    padding=False,  # Don't pad - we'll handle this in grouping
+                )
+            
             if self.insert_eos:
-                EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
+                # Handle both tokenizers.Tokenizer (OWT2) and HuggingFace tokenizers
+                if is_tokenizers_lib:
+                    EOS = self._eos_token_id
+                else:
+                    EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
                 tokens = {"input_ids": [t + [EOS] for t in tokens["input_ids"]]}
         else:
             # Standard tokenization with truncation/padding
-            tokens = self.tokenizer(
-                texts,
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-                add_special_tokens=True,
-                return_attention_mask=True,
-                return_token_type_ids=False,
-            )
+            if is_tokenizers_lib:
+                # For tokenizers.Tokenizer (OWT2), encode and pad/truncate manually
+                tokenized = self.tokenizer.encode_batch(texts, add_special_tokens=True)
+                input_ids = []
+                attention_mask = []
+                for enc in tokenized:
+                    ids = enc.ids[:self.max_length]  # Truncate
+                    # Pad to max_length
+                    pad_length = self.max_length - len(ids)
+                    ids = ids + [0] * pad_length  # Use 0 as pad token ID
+                    input_ids.append(ids)
+                    attention_mask.append([1] * (self.max_length - pad_length) + [0] * pad_length)
+                tokens = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+            else:
+                # For HuggingFace tokenizers
+                tokens = self.tokenizer(
+                    texts,
+                    max_length=self.max_length,
+                    padding="max_length",
+                    truncation=True,
+                    add_special_tokens=True,
+                    return_attention_mask=True,
+                    return_token_type_ids=False,
+                )
         return tokens
 
     def __len__(self):
@@ -344,9 +415,29 @@ def get_dataloader(config, tokenizer, split="train"):
 
 # You may use LightningDataModule to wrap the dataset and dataloader
 # Or directly use get_dataloader in your training script
-class MultiDataModule(L.LightningDataModule):
+class MultiDataModule:
+    """
+    LightningDataModule wrapper (optional).
+    Lightning import is delayed to avoid import errors if Lightning is not available.
+    """
     def __init__(self, config: DatasetConfig, tokenizer):
-        super().__init__()
+        # Lazy import to avoid import errors if Lightning is not available
+        try:
+            import lightning as L
+            self._L = L
+            # Create a temporary class that inherits from LightningDataModule
+            class _LightningDataModule(L.LightningDataModule):
+                def __init__(self, config, tokenizer):
+                    super().__init__()
+                    self.config = config
+                    self.tokenizer = tokenizer
+            # Use composition instead of inheritance to avoid import issues
+            self._lightning_module = _LightningDataModule(config, tokenizer)
+        except ImportError:
+            raise ImportError(
+                "Lightning is required for MultiDataModule. "
+                "Use get_dataloader() directly instead, or install lightning."
+            )
         self.config = config
         self.tokenizer = tokenizer
 
