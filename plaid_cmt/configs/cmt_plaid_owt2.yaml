@@ -1,0 +1,44 @@
+teacher_weights_dir: checkpoints/plaid1b_weights
+out_dir: checkpoints_cmt_plaid1b_owt2
+
+# Model architecture (can be overridden via CLI: --dim=2048 --n_blocks=24 --n_heads=32)
+dim: 2048
+n_blocks: 24
+n_heads: 32
+gamma_0: -3.0
+gamma_1: 6.0
+
+# Model / data
+# IMPORTANT: Teacher and student must use the same tokenizer/vocab_size for CMT
+# If teacher uses OWT2 (vocab_size=32768), set use_owt2_tokenizer: true
+# If teacher uses BERT (vocab_size=30522), set use_owt2_tokenizer: false and tokenizer_name
+use_owt2_tokenizer: true  # Set to true if teacher uses OWT2 tokenizer
+tokenizer_name: null  # Only used if use_owt2_tokenizer is false
+embed_dim: 16
+seq_len: 128
+batch_size: 128
+val_batch_size: 128
+num_workers: 0  # Set to 0 to avoid multiprocessing device issues
+
+# Diffusion / CMT
+t_min: 0.02
+t_max: 1.0
+teacher_steps: 8
+cmt_weight: 1.0
+ema_decay: 0.9999
+ddim_sampler: false  # Use VDM-style sampling by default
+score_temp: 0.9
+cache_size: 1000  # LRU cache size for teacher outputs
+
+# Optimizer
+lr: 1.0e-4
+weight_decay: 1.0e-4
+grad_clip: 1.0
+
+# Training schedule
+epochs: 1000000
+max_steps: 200000
+log_every: 50
+ckpt_every: 1000
+
+
